@@ -4,6 +4,8 @@ import time
 import re
 import logging
 import os
+import sys
+from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.types import Message, CallbackQuery, FSInputFile, InputMediaPhoto
 from aiogram.filters import CommandStart, Command, StateFilter
@@ -16,40 +18,75 @@ from aiogram.exceptions import TelegramBadRequest
 TOKEN = "8518608816:AAE2sq4E2ZqWPcPhec_DrIvM-DUllyzJZOY"
 MAIN_ADMIN_ID = 5413256595
 PROXY_NAME = "SalutProxy"
+PROXY_FILE_PATH = "proxy.txt"
 
-logging.basicConfig(level=logging.INFO)
+# Названия файлов изображений
+IMG_PRIVET = "privet.png"   # Старт
+IMG_PROFILE = "profile.png" # Профиль
+IMG_PROXY = "proxy.png"     # Прокси, Локации, Инфо, Поддержка
+IMG_REFKA = "refka.png"     # Рефералка
+IMG_ADMIN = "admin.png"     # Админка
+IMG_INFA = "infa.png"       # Рассылка
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 router = Router()
 dp.include_router(router)
 
-# ================= ГЕНЕРАТОР КАРТИНОК-ЗАГЛУШЕК =================
-def ensure_image_exists(filename):
-    if not os.path.exists(filename):
-        with open(filename, 'wb') as f:
-            # 1x1 прозрачный PNG пиксель (заглушка от ошибок, если картинки нет)
-            f.write(b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82')
+# ================= УТИЛИТЫ =================
+def ensure_files_exist():
+    """Создает заглушки для картинок и proxy.txt, если их нет, чтобы бот не падал."""
+    images = [IMG_PRIVET, IMG_PROFILE, IMG_PROXY, IMG_REFKA, IMG_ADMIN, IMG_INFA]
+    for img in images:
+        if not os.path.exists(img):
+            with open(img, 'wb') as f:
+                f.write(b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82')
+    
+    if not os.path.exists(PROXY_FILE_PATH):
+        with open(PROXY_FILE_PATH, 'w') as f:
+            f.write("") # Создаем пустой файл
+
+def get_media(filename):
     return FSInputFile(filename)
 
-# Названия всех картинок по разделам
-IMG_PRIVET = "privet.png"  # Приветствие /start
-IMG_PROFILE = "profile.png" # Главный профиль
-IMG_PROXY = "proxy.png"     # Подключение, локации, информация
-IMG_INFA = "infa.png"       # Рассылка /everyone
-IMG_ADMIN = "admin.png"     # Вся панель администратора
-IMG_REFKA = "refka.png"     # Раздел партнерской программы (рефералы)
+def format_vip_time(vip_end_str):
+    if not vip_end_str:
+        return "Не активен"
+    try:
+        end_date = datetime.strptime(vip_end_str, "%Y-%m-%d %H:%M:%S")
+        if end_date < datetime.now():
+            return "Истек"
+        
+        delta = end_date - datetime.now()
+        days = delta.days
+        hours = delta.seconds // 3600
+        return f"{days} дн. {hours} ч."
+    except:
+        return "Ошибка даты"
+
+def guess_country(ip):
+    if ip.startswith("85."): return "🇩🇪 Германия"
+    if ip.startswith("176."): return "🇳🇱 Нидерланды"
+    if ip.startswith("83."): return "🇫🇷 Франция"
+    if ip.startswith("5."): return "🇬🇧 Великобритания"
+    if ip.startswith("91."): return "🇺🇸 США"
+    return "🇪🇺 Европа"
 
 # ================= БАЗА ДАННЫХ =================
 def init_db():
     conn = sqlite3.connect("salut_proxy.db")
     cursor = conn.cursor()
+    # Таблица пользователей
     cursor.execute('''CREATE TABLE IF NOT EXISTS users (
                         user_id INTEGER PRIMARY KEY,
                         username TEXT,
                         referrer_id INTEGER,
                         refs_count INTEGER DEFAULT 0,
-                        is_vip INTEGER DEFAULT 0
+                        is_vip_permanent INTEGER DEFAULT 0,
+                        vip_end_date TIMESTAMP DEFAULT NULL
                     )''')
+    # Таблица прокси
     cursor.execute('''CREATE TABLE IF NOT EXISTS proxies (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         server TEXT,
@@ -60,6 +97,7 @@ def init_db():
                         UNIQUE(server, port)
                     )''')
     
+    # Миграция (на случай старой БД)
     cursor.execute("PRAGMA table_info(proxies)")
     columns = [col[1] for col in cursor.fetchall()]
     if 'country' not in columns:
@@ -68,371 +106,428 @@ def init_db():
     conn.commit()
     conn.close()
 
-def guess_country(ip):
-    if ip.startswith("85."): return "Германия"
-    if ip.startswith("176."): return "Нидерланды"
-    if ip.startswith("83."): return "Франция"
-    return "Европа"
-
-def add_proxy_to_db(link):
-    conn = sqlite3.connect("salut_proxy.db")
-    cursor = conn.cursor()
-    match = re.search(r'server=([^&]+)&port=(\d+)&secret=([^&]+)', link)
-    success = False
-    if match:
-        server, port, secret = match.groups()
-        country = guess_country(server)
-        try:
-            cursor.execute("INSERT OR IGNORE INTO proxies (server, port, secret, country) VALUES (?, ?, ?, ?)", 
-                           (server, int(port), secret, country))
-            if cursor.rowcount > 0: success = True
-            conn.commit()
-        except: pass
-    conn.close()
-    return success
-
 def db_query(query, args=(), fetchone=False, fetchall=False, commit=False):
     conn = sqlite3.connect("salut_proxy.db")
     cursor = conn.cursor()
-    cursor.execute(query, args)
-    res = None
-    if fetchone: res = cursor.fetchone()
-    if fetchall: res = cursor.fetchall()
-    if commit: conn.commit()
-    conn.close()
-    return res
+    try:
+        cursor.execute(query, args)
+        if commit: conn.commit()
+        if fetchone: return cursor.fetchone()
+        if fetchall: return cursor.fetchall()
+    except Exception as e:
+        logging.error(f"DB Error: {e}")
+    finally:
+        conn.close()
 
-def is_admin(user_id):
-    if user_id == MAIN_ADMIN_ID: return True
-    res = db_query("SELECT is_vip FROM users WHERE user_id = ?", (user_id,), fetchone=True)
-    return res[0] == 1 if res else False
+def add_proxy_to_db(link):
+    match = re.search(r'server=([^&]+)&port=(\d+)&secret=([^&]+)', link)
+    if match:
+        server, port, secret = match.groups()
+        country = guess_country(server)
+        conn = sqlite3.connect("salut_proxy.db")
+        try:
+            conn.execute("INSERT OR IGNORE INTO proxies (server, port, secret, country) VALUES (?, ?, ?, ?)", 
+                         (server, int(port), secret, country))
+            conn.commit()
+            return True
+        except: return False
+        finally: conn.close()
+    return False
+
+def load_proxies_from_file():
+    if not os.path.exists(PROXY_FILE_PATH): return 0
+    count = 0
+    with open(PROXY_FILE_PATH, 'r', encoding='utf-8') as f:
+        for line in f:
+            if "proxy?" in line:
+                if add_proxy_to_db(line.strip()):
+                    count += 1
+    return count
+
+# ================= ЛОГИКА СТАТУСОВ =================
+def get_user_status(user_id):
+    user = db_query("SELECT is_vip_permanent, vip_end_date, refs_count FROM users WHERE user_id = ?", (user_id,), fetchone=True)
+    if not user: return "Базовый", False
+    
+    is_perm, vip_end, refs = user
+    
+    # 1. Админ / Вечный VIP
+    if user_id == MAIN_ADMIN_ID or is_perm:
+        return "Администратор", True
+
+    # 2. Временный VIP (за рефералов)
+    if vip_end:
+        try:
+            end_date = datetime.strptime(vip_end, "%Y-%m-%d %H:%M:%S")
+            if end_date > datetime.now():
+                return "Премиум (Активен)", True
+        except: pass
+    
+    # 3. Базовый
+    return "Базовый", False
+
+def add_vip_days(user_id, days=1):
+    user = db_query("SELECT vip_end_date FROM users WHERE user_id = ?", (user_id,), fetchone=True)
+    current_end = user[0] if user else None
+    
+    now = datetime.now()
+    
+    if current_end:
+        try:
+            current_date = datetime.strptime(current_end, "%Y-%m-%d %H:%M:%S")
+            if current_date > now:
+                new_date = current_date + timedelta(days=days)
+            else:
+                new_date = now + timedelta(days=days)
+        except:
+            new_date = now + timedelta(days=days)
+    else:
+        new_date = now + timedelta(days=days)
+        
+    db_query("UPDATE users SET vip_end_date = ? WHERE user_id = ?", (new_date.strftime("%Y-%m-%d %H:%M:%S"), user_id), commit=True)
 
 # ================= ПИНГАТОР =================
 async def ping_proxy(server, port):
     try:
         start_time = time.time()
-        reader, writer = await asyncio.wait_for(asyncio.open_connection(server, port), timeout=1.5)
+        reader, writer = await asyncio.wait_for(asyncio.open_connection(server, port), timeout=2.0)
         ping_ms = int((time.time() - start_time) * 1000)
         writer.close()
         await writer.wait_closed()
         return ping_ms
-    except Exception:
+    except:
         return 9999
 
 async def update_all_pings():
     proxies = db_query("SELECT id, server, port FROM proxies", fetchall=True)
+    if not proxies: return
     for p_id, server, port in proxies:
         ping = await ping_proxy(server, port)
         db_query("UPDATE proxies SET ping_ms = ? WHERE id = ?", (ping, p_id), commit=True)
 
 async def background_ping_task():
     while True:
-        await asyncio.sleep(180) # Авто-обновление пинга каждые 3 минуты
-        await update_all_pings()
+        await asyncio.sleep(180) # Каждые 3 минуты
+        try:
+            await update_all_pings()
+        except Exception as e:
+            logging.error(f"Ping Error: {e}")
 
 # ================= МАШИНА СОСТОЯНИЙ =================
-class AdminState(StatesGroup):
-    waiting_for_proxy = State()
-    waiting_for_delete_id = State()
-    waiting_for_vip = State()
+class States(StatesGroup):
+    waiting_proxy_text = State()
+    waiting_del_id = State()
+    waiting_vip_id = State()
+    waiting_broadcast = State()
+    waiting_support_msg = State()
+    waiting_support_reply = State()
 
-# ================= ИНТЕРФЕЙС / КЛАВИАТУРЫ =================
+# ================= КЛАВИАТУРЫ =================
 def start_kb():
-    b = InlineKeyboardBuilder()
-    b.button(text="Продолжить", callback_data="open_profile")
-    return b.as_markup()
+    return InlineKeyboardBuilder().button(text="Продолжить", callback_data="open_profile").as_markup()
 
-def profile_kb(admin=False):
+def profile_kb(is_admin):
     b = InlineKeyboardBuilder()
-    b.button(text="Подключить прокси", callback_data="get_proxy")
-    b.button(text="Локации серверов", callback_data="locations")
-    b.button(text="Партнерская программа", callback_data="referrals")
-    b.button(text="О сервисе", callback_data="about")
-    if admin:
-        b.button(text="Панель администратора", callback_data="admin_panel")
-    b.adjust(1, 2, 1, 1) if admin else b.adjust(1, 2, 1)
+    b.button(text="⚡️ Подключить прокси", callback_data="get_proxy")
+    b.button(text="🌍 Локации", callback_data="locations")
+    b.button(text="👥 Партнерская программа", callback_data="referrals")
+    b.button(text="❓ О сервисе", callback_data="about")
+    b.button(text="📩 Поддержка", callback_data="support")
+    if is_admin:
+        b.button(text="⚙️ Панель админа", callback_data="admin_panel")
+    b.adjust(1, 2, 2, 1)
     return b.as_markup()
 
 def admin_kb():
     b = InlineKeyboardBuilder()
-    b.button(text="Добавить", callback_data="admin_add_proxy")
-    b.button(text="Удалить", callback_data="admin_del_proxy")
-    b.button(text="Обновить пинг", callback_data="admin_update_ping")
-    b.button(text="Статистика", callback_data="admin_stats")
-    b.button(text="Выдать права", callback_data="admin_add_vip")
-    b.button(text="Назад в профиль", callback_data="open_profile")
-    b.adjust(2, 1, 2, 1)
+    b.button(text="➕ Ввод текста", callback_data="admin_add_text")
+    b.button(text="📂 Из proxy.txt", callback_data="admin_load_file")
+    b.button(text="🗑 Удалить", callback_data="admin_del")
+    b.button(text="🔄 Обновить пинг", callback_data="admin_ping")
+    b.button(text="📊 Статистика", callback_data="admin_stats")
+    b.button(text="👑 Выдать права", callback_data="admin_vip")
+    b.button(text="📢 Рассылка", callback_data="admin_broadcast")
+    b.button(text="🔙 В профиль", callback_data="open_profile")
+    b.adjust(2, 2, 1, 2, 1)
     return b.as_markup()
 
 def back_kb(to="open_profile"):
-    b = InlineKeyboardBuilder()
-    b.button(text="Назад", callback_data=to)
-    return b.as_markup()
+    return InlineKeyboardBuilder().button(text="🔙 Назад", callback_data=to).as_markup()
 
-async def safe_edit_media(callback: CallbackQuery, media: InputMediaPhoto, reply_markup):
-    try:
-        await callback.message.edit_media(media=media, reply_markup=reply_markup)
-    except TelegramBadRequest:
-        pass 
+async def safe_edit(call: CallbackQuery, media, kb):
+    try: await call.message.edit_media(media=media, reply_markup=kb)
+    except TelegramBadRequest: pass
 
-# ================= ЛОГИКА: СТАРТ И ПРОФИЛЬ =================
+# ================= ХЕНДЛЕРЫ: СТАРТ И ПРОФИЛЬ =================
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     user_id = message.from_user.id
-    username = message.from_user.username or message.from_user.first_name or "Пользователь"
-    args = message.text.split()[1] if len(message.text.split()) > 1 else None
-
-    user = db_query("SELECT user_id FROM users WHERE user_id = ?", (user_id,), fetchone=True)
-    if not user:
-        referrer_id = int(args) if args and args.isdigit() and int(args) != user_id else None
-        db_query("INSERT INTO users (user_id, username, referrer_id) VALUES (?, ?, ?)", 
-                 (user_id, username, referrer_id), commit=True)
+    username = message.from_user.username or "Пользователь"
+    
+    # Регистрация
+    if not db_query("SELECT user_id FROM users WHERE user_id = ?", (user_id,), fetchone=True):
+        args = message.text.split()
+        referrer_id = int(args[1]) if len(args) > 1 and args[1].isdigit() and int(args[1]) != user_id else None
+        
+        db_query("INSERT INTO users (user_id, username, referrer_id) VALUES (?, ?, ?)", (user_id, username, referrer_id), commit=True)
+        
+        # Начисление бонуса рефереру
         if referrer_id:
             db_query("UPDATE users SET refs_count = refs_count + 1 WHERE user_id = ?", (referrer_id,), commit=True)
+            add_vip_days(referrer_id, 1)
+            try:
+                await bot.send_message(referrer_id, "🎉 <b>Новый реферал!</b>\nВам начислен +1 день Премиум доступа.", parse_mode="HTML")
+            except: pass
 
     try: await message.delete()
     except: pass
-
-    text = (
-        f"👋 Добро пожаловать в <b>{PROXY_NAME}</b>!\n\n"
-        f"Мы предоставляем надежные и быстрые MTProto прокси для Telegram. "
-        f"Нажмите кнопку ниже, чтобы открыть ваш профиль и получить настройки."
-    )
-    # Использует PRIVET.PNG
-    await message.answer_photo(photo=ensure_image_exists(IMG_PRIVET), caption=text, reply_markup=start_kb(), parse_mode="HTML")
+    
+    text = f"👋 Привет, {username}!\nДобро пожаловать в <b>{PROXY_NAME}</b>."
+    await message.answer_photo(photo=get_media(IMG_PRIVET), caption=text, reply_markup=start_kb(), parse_mode="HTML")
 
 @router.callback_query(F.data == "open_profile")
-async def process_profile(callback: CallbackQuery, state: FSMContext):
+async def open_profile(call: CallbackQuery, state: FSMContext):
     await state.clear()
-    user_id = callback.from_user.id
-    username = callback.from_user.username or callback.from_user.first_name or "Пользователь"
+    user_id = call.from_user.id
+    status_text, is_vip = get_user_status(user_id)
+    is_admin_rights = (user_id == MAIN_ADMIN_ID) or (status_text == "Администратор")
     
-    admin_status = is_admin(user_id)
-    refs_count = db_query("SELECT refs_count FROM users WHERE user_id = ?", (user_id,), fetchone=True)[0]
+    user_data = db_query("SELECT refs_count, vip_end_date FROM users WHERE user_id = ?", (user_id,), fetchone=True)
+    refs = user_data[0]
+    vip_time = format_vip_time(user_data[1])
     
-    if admin_status:
-        lvl = "Администратор"
-        greet = "Здравствуйте! У вас полный доступ к управлению сервисом."
-    elif refs_count > 0:
-        lvl = "Премиум"
-        greet = "Отличная работа! Вам доступны серверы с повышенной скоростью."
-    else:
-        lvl = "Базовый"
-        greet = "Используйте наши прокси для комфортного и безопасного общения."
-
     text = (
-        f"{greet}\n\n"
-        f"👤 <b>Ваш профиль:</b> {username}\n"
-        f"💎 <b>Статус:</b> {lvl}\n"
-        f"👥 <b>Приглашено друзей:</b> {refs_count}\n\n"
-        f"<i>💡 Совет: приглашайте друзей, чтобы система автоматически выделяла вам серверы с минимальным откликом.</i>"
+        f"👤 <b>Личный кабинет</b>\n\n"
+        f"💎 Статус: <b>{status_text}</b>\n"
+        f"⏳ Действует: <b>{vip_time}</b>\n"
+        f"👥 Рефералов: <b>{refs}</b>\n\n"
+        f"<i>Приглашайте друзей, чтобы получить бесплатный Премиум!</i>"
     )
+    
+    await safe_edit(call, InputMediaPhoto(media=get_media(IMG_PROFILE), caption=text, parse_mode="HTML"), profile_kb(is_admin_rights))
 
-    # Использует PROFILE.PNG
-    media = InputMediaPhoto(media=ensure_image_exists(IMG_PROFILE), caption=text, parse_mode="HTML")
-    await safe_edit_media(callback, media, profile_kb(admin_status))
-
-# ================= ЛОГИКА: ПРОКСИ И ИНФО (ИСПОЛЬЗУЕТ PROXY.PNG) =================
+# ================= ХЕНДЛЕРЫ: ПРОКСИ И ИНФО (PROXY.PNG) =================
 @router.callback_query(F.data == "get_proxy")
-async def process_get_proxy(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    admin_status = is_admin(user_id)
-    refs_count = db_query("SELECT refs_count FROM users WHERE user_id = ?", (user_id,), fetchone=True)[0]
-
+async def get_proxy(call: CallbackQuery):
+    user_id = call.from_user.id
+    status, is_vip = get_user_status(user_id)
+    
     proxies = db_query("SELECT server, port, secret, country, ping_ms FROM proxies WHERE ping_ms < 9999 ORDER BY ping_ms ASC", fetchall=True)
+    
     if not proxies:
-        return await callback.answer("В данный момент нет доступных серверов. Пожалуйста, подождите.", show_alert=True)
-
-    if admin_status: selected = proxies[0]
-    elif refs_count > 0: selected = proxies[min(len(proxies)-1, max(0, len(proxies) // 3))]
-    else: selected = proxies[-1]
+        return await call.answer("Серверы обновляются, попробуйте позже.", show_alert=True)
+    
+    # Алгоритм выдачи
+    if status == "Администратор":
+        selected = proxies[0] # Топ 1
+    elif is_vip: # Премиум
+        # Топ 30%
+        idx = min(len(proxies)-1, int(len(proxies) * 0.3))
+        selected = proxies[idx]
+    else: # Базовый
+        selected = proxies[-1] # Самый медленный (но рабочий)
 
     server, port, secret, country, ping = selected
-    proxy_url = f"https://t.me/proxy?server={server}&port={port}&secret={secret}"
+    link = f"https://t.me/proxy?server={server}&port={port}&secret={secret}"
     
     text = (
-        f"✅ <b>Ваш прокси готов к работе!</b>\n\n"
+        f"✅ <b>Сервер подобран</b>\n\n"
         f"📍 Локация: <b>{country}</b>\n"
-        f"⚡️ Скорость отклика: <b>{ping} ms</b>\n"
-        f"🛡 Протокол: <b>MTProto</b>\n\n"
-        f"<i>Нажмите кнопку ниже, чтобы применить настройки в Telegram.</i>"
+        f"⚡️ Пинг: <b>{ping} ms</b>\n"
+        f"🔐 Шифрование: <b>MTProto</b>\n\n"
+        f"<i>Нажмите кнопку ниже для подключения.</i>"
     )
-    b = InlineKeyboardBuilder()
-    b.button(text="Подключить", url=proxy_url)
-    b.button(text="Назад", callback_data="open_profile")
-    
-    media = InputMediaPhoto(media=ensure_image_exists(IMG_PROXY), caption=text, parse_mode="HTML")
-    await safe_edit_media(callback, media, b.as_markup())
+    kb = InlineKeyboardBuilder().button(text="⚡️ Подключить", url=link).button(text="🔙 Назад", callback_data="open_profile").as_markup()
+    await safe_edit(call, InputMediaPhoto(media=get_media(IMG_PROXY), caption=text, parse_mode="HTML"), kb)
 
 @router.callback_query(F.data == "locations")
-async def process_locations(callback: CallbackQuery):
-    countries = db_query("SELECT country, MIN(ping_ms) FROM proxies WHERE ping_ms < 9999 GROUP BY country", fetchall=True)
-    
-    if countries:
-        c_list = "\n".join([f"• {c[0]} — <b>{c[1]} ms</b>" for c in countries])
-    else:
-        c_list = "Нет активных локаций."
-        
-    text = (
-        f"🌍 <b>Активные локации серверов:</b>\n\n"
-        f"{c_list}\n\n"
-        f"<i>Система автоматически подбирает для вас лучший сервер в зависимости от вашего статуса. Данные обновляются в реальном времени.</i>"
-    )
-    media = InputMediaPhoto(media=ensure_image_exists(IMG_PROXY), caption=text, parse_mode="HTML")
-    await safe_edit_media(callback, media, back_kb())
+async def locations(call: CallbackQuery):
+    data = db_query("SELECT country, MIN(ping_ms) FROM proxies WHERE ping_ms < 9999 GROUP BY country", fetchall=True)
+    list_text = "\n".join([f"• {r[0]} — <b>{r[1]} ms</b>" for r in data]) if data else "Нет данных"
+    text = f"🌍 <b>Локации и лучший пинг:</b>\n\n{list_text}"
+    await safe_edit(call, InputMediaPhoto(media=get_media(IMG_PROXY), caption=text, parse_mode="HTML"), back_kb())
 
 @router.callback_query(F.data == "about")
-async def process_about(callback: CallbackQuery):
-    text = (
-        f"ℹ️ <b>О сервисе SalutProxy</b>\n\n"
-        f"Мы предоставляем стабильные узлы MTProto для обеспечения безопасного соединения с серверами Telegram.\n\n"
-        f"Ваш трафик защищен сквозным шифрованием, а система мониторинга круглосуточно проверяет скорость каждого сервера, чтобы вы получали лучшее качество связи."
-    )
-    media = InputMediaPhoto(media=ensure_image_exists(IMG_PROXY), caption=text, parse_mode="HTML")
-    await safe_edit_media(callback, media, back_kb())
+async def about(call: CallbackQuery):
+    text = f"ℹ️ <b>О сервисе {PROXY_NAME}</b>\n\nАвтоматическая система выдачи MTProxy.\nМы мониторим доступность серверов каждые 3 минуты.\nВаш статус определяет скорость соединения."
+    await safe_edit(call, InputMediaPhoto(media=get_media(IMG_PROXY), caption=text, parse_mode="HTML"), back_kb())
 
-# ================= ЛОГИКА: ПАРТНЕРСКАЯ ПРОГРАММА (ИСПОЛЬЗУЕТ REFKA.PNG) =================
+# ================= ХЕНДЛЕРЫ: РЕФЕРАЛКА (REFKA.PNG) =================
 @router.callback_query(F.data == "referrals")
-async def process_referrals(callback: CallbackQuery):
-    user_id = callback.from_user.id
+async def referrals(call: CallbackQuery):
+    user_id = call.from_user.id
     refs = db_query("SELECT refs_count FROM users WHERE user_id = ?", (user_id,), fetchone=True)[0]
     bot_info = await bot.get_me()
+    link = f"https://t.me/{bot_info.username}?start={user_id}"
+    
     text = (
         f"🔗 <b>Партнерская программа</b>\n\n"
-        f"Скорость выдаваемых вам серверов зависит от вашей активности. Поделитесь ссылкой с друзьями, чтобы получить статус «Премиум».\n\n"
-        f"👥 Приглашено друзей: <b>{refs}</b>\n\n"
-        f"<b>Ваша персональная ссылка:</b>\n<code>https://t.me/{bot_info.username}?start={user_id}</code>"
+        f"Приглашай друзей и получай <b>+1 день Премиума</b> за каждого!\n\n"
+        f"👥 Приглашено: <b>{refs}</b>\n"
+        f"🔗 Твоя ссылка:\n<code>{link}</code>"
     )
-    # Использует REFKA.PNG
-    media = InputMediaPhoto(media=ensure_image_exists(IMG_REFKA), caption=text, parse_mode="HTML")
-    await safe_edit_media(callback, media, back_kb())
+    await safe_edit(call, InputMediaPhoto(media=get_media(IMG_REFKA), caption=text, parse_mode="HTML"), back_kb())
 
-# ================= ЛОГИКА: АДМИНКА (ИСПОЛЬЗУЕТ ADMIN.PNG) =================
+# ================= ХЕНДЛЕРЫ: ПОДДЕРЖКА (PROXY.PNG) =================
+@router.callback_query(F.data == "support")
+async def support(call: CallbackQuery, state: FSMContext):
+    text = "📩 <b>Поддержка</b>\n\nОпишите вашу проблему следующим сообщением.\nАдминистратор ответит вам."
+    await safe_edit(call, InputMediaPhoto(media=get_media(IMG_PROXY), caption=text, parse_mode="HTML"), back_kb())
+    await state.set_state(States.waiting_support_msg)
+
+@router.message(StateFilter(States.waiting_support_msg))
+async def support_msg(message: Message, state: FSMContext):
+    # Отправка админу
+    admin_text = f"📩 <b>Тикет от пользователя</b>\nID: <code>{message.from_user.id}</code>\n@{message.from_user.username}\n\nТекст:\n{message.text}"
+    kb = InlineKeyboardBuilder().button(text="Ответить", callback_data=f"reply_{message.from_user.id}").as_markup()
+    try:
+        await bot.send_message(MAIN_ADMIN_ID, admin_text, reply_markup=kb, parse_mode="HTML")
+        await message.answer("✅ Ваше сообщение отправлено! Ожидайте ответа.")
+    except:
+        await message.answer("Ошибка отправки.")
+    await state.clear()
+
+@router.callback_query(F.data.startswith("reply_"))
+async def admin_reply_start(call: CallbackQuery, state: FSMContext):
+    user_id = int(call.data.split("_")[1])
+    await call.message.answer(f"Введите ответ для пользователя {user_id}:")
+    await state.update_data(reply_to_id=user_id)
+    await state.set_state(States.waiting_support_reply)
+    await call.answer()
+
+@router.message(StateFilter(States.waiting_support_reply))
+async def admin_reply_send(message: Message, state: FSMContext):
+    data = await state.get_data()
+    target_id = data.get("reply_to_id")
+    try:
+        await bot.send_message(target_id, f"📩 <b>Ответ от поддержки:</b>\n\n{message.text}", parse_mode="HTML")
+        await message.answer("✅ Ответ отправлен.")
+    except:
+        await message.answer("❌ Не удалось отправить (пользователь заблокировал бота).")
+    await state.clear()
+
+# ================= ХЕНДЛЕРЫ: АДМИНКА (ADMIN.PNG) =================
 @router.callback_query(F.data == "admin_panel")
-async def admin_panel(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id): return
-    text = "⚙️ <b>Панель управления SalutProxy</b>\n\nВыберите нужное действие:"
-    # Использует ADMIN.PNG
-    media = InputMediaPhoto(media=ensure_image_exists(IMG_ADMIN), caption=text, parse_mode="HTML")
-    await safe_edit_media(callback, media, admin_kb())
+async def admin_main(call: CallbackQuery):
+    if not get_user_status(call.from_user.id)[1]: return
+    text = "⚙️ <b>Панель управления</b>\n\nВыберите действие:"
+    await safe_edit(call, InputMediaPhoto(media=get_media(IMG_ADMIN), caption=text, parse_mode="HTML"), admin_kb())
 
-@router.callback_query(F.data == "admin_stats")
-async def admin_stats(callback: CallbackQuery):
-    u = db_query("SELECT COUNT(*) FROM users", fetchone=True)[0]
-    p = db_query("SELECT COUNT(*) FROM proxies", fetchone=True)[0]
-    p_a = db_query("SELECT COUNT(*) FROM proxies WHERE ping_ms < 9999", fetchone=True)[0]
-    await callback.answer(f"📊 Статистика:\n\nПользователей: {u}\nВсего серверов: {p}\nВ сети: {p_a}", show_alert=True)
+@router.callback_query(F.data == "admin_load_file")
+async def load_file(call: CallbackQuery):
+    count = load_proxies_from_file()
+    await call.answer(f"Загружено из файла: {count} шт.", show_alert=True)
 
-@router.callback_query(F.data == "admin_update_ping")
-async def admin_ping(callback: CallbackQuery):
-    await callback.answer("Запущено обновление серверов...", show_alert=False)
-    await update_all_pings()
-    text = "✅ <b>Пинг серверов успешно обновлен.</b>"
-    media = InputMediaPhoto(media=ensure_image_exists(IMG_ADMIN), caption=text, parse_mode="HTML")
-    await safe_edit_media(callback, media, admin_kb())
+@router.callback_query(F.data == "admin_add_text")
+async def add_text(call: CallbackQuery, state: FSMContext):
+    await safe_edit(call, InputMediaPhoto(media=get_media(IMG_ADMIN), caption="Отправьте прокси списком:", parse_mode="HTML"), back_kb("admin_panel"))
+    await state.set_state(States.waiting_proxy_text)
 
-@router.callback_query(F.data == "admin_add_proxy")
-async def admin_add(callback: CallbackQuery, state: FSMContext):
-    text = "📡 <b>Добавление серверов</b>\n\nОтправьте в чат ссылки на MTProxy (можно списком)."
-    media = InputMediaPhoto(media=ensure_image_exists(IMG_ADMIN), caption=text, parse_mode="HTML")
-    await safe_edit_media(callback, media, back_kb("admin_panel"))
-    await state.set_state(AdminState.waiting_for_proxy)
-
-@router.message(StateFilter(AdminState.waiting_for_proxy))
-async def process_new_proxy(message: Message, state: FSMContext):
+@router.message(StateFilter(States.waiting_proxy_text))
+async def add_text_process(message: Message, state: FSMContext):
     await message.delete()
     links = re.findall(r'(?:tg://|https://t\.me/)proxy\?[^\s]+', message.text)
-    if not links: return
-    added = sum(1 for link in links if add_proxy_to_db(link))
+    added = sum(1 for l in links if add_proxy_to_db(l))
+    msg = await message.answer(f"✅ Добавлено: {added}")
     await state.clear()
-    msg = await message.answer(f"✅ Успешно добавлено серверов: {added} из {len(links)}")
     await asyncio.sleep(3)
     try: await msg.delete()
     except: pass
 
-@router.callback_query(F.data == "admin_del_proxy")
-async def admin_del(callback: CallbackQuery, state: FSMContext):
-    proxies = db_query("SELECT id, server, ping_ms FROM proxies", fetchall=True)
-    if not proxies:
-        return await callback.answer("В базе нет серверов.", show_alert=True)
-    
-    p_list = "\n".join([f"ID: <code>{p[0]}</code> | IP: {p[1]} | Пинг: {p[2]} ms" for p in proxies])
-    text = f"🗑 <b>Удаление сервера</b>\n\nТекущие серверы:\n{p_list}\n\nОтправьте ID сервера, который хотите удалить."
-    media = InputMediaPhoto(media=ensure_image_exists(IMG_ADMIN), caption=text, parse_mode="HTML")
-    await safe_edit_media(callback, media, back_kb("admin_panel"))
-    await state.set_state(AdminState.waiting_for_delete_id)
+@router.callback_query(F.data == "admin_del")
+async def del_proxy(call: CallbackQuery, state: FSMContext):
+    proxies = db_query("SELECT id, server FROM proxies", fetchall=True)
+    if not proxies: return await call.answer("Пусто", show_alert=True)
+    text = "Введите ID для удаления:\n\n" + "\n".join([f"ID: {p[0]} | IP: {p[1]}" for p in proxies])
+    await safe_edit(call, InputMediaPhoto(media=get_media(IMG_ADMIN), caption=text[:1000], parse_mode="HTML"), back_kb("admin_panel"))
+    await state.set_state(States.waiting_del_id)
 
-@router.message(StateFilter(AdminState.waiting_for_delete_id))
-async def process_del_proxy(message: Message, state: FSMContext):
+@router.message(StateFilter(States.waiting_del_id))
+async def del_process(message: Message, state: FSMContext):
     await message.delete()
     if message.text.isdigit():
         db_query("DELETE FROM proxies WHERE id = ?", (int(message.text),), commit=True)
-        msg = await message.answer(f"✅ Сервер успешно удален.")
-    else:
-        msg = await message.answer("❌ Ошибка: ID должен быть числом.")
+        msg = await message.answer("✅ Удалено")
+    else: msg = await message.answer("Ошибка")
     await state.clear()
     await asyncio.sleep(2)
     try: await msg.delete()
     except: pass
 
-@router.callback_query(F.data == "admin_add_vip")
-async def admin_vip(callback: CallbackQuery, state: FSMContext):
-    text = "👑 <b>Выдача прав администратора</b>\n\nОтправьте Telegram ID пользователя."
-    media = InputMediaPhoto(media=ensure_image_exists(IMG_ADMIN), caption=text, parse_mode="HTML")
-    await safe_edit_media(callback, media, back_kb("admin_panel"))
-    await state.set_state(AdminState.waiting_for_vip)
+@router.callback_query(F.data == "admin_ping")
+async def force_ping(call: CallbackQuery):
+    await call.answer("Обновляю...", show_alert=False)
+    await update_all_pings()
+    await call.answer("✅ Готово!", show_alert=True)
 
-@router.message(StateFilter(AdminState.waiting_for_vip))
-async def process_new_vip(message: Message, state: FSMContext):
+@router.callback_query(F.data == "admin_stats")
+async def stats(call: CallbackQuery):
+    u = db_query("SELECT COUNT(*) FROM users", fetchone=True)[0]
+    p = db_query("SELECT COUNT(*) FROM proxies", fetchone=True)[0]
+    pa = db_query("SELECT COUNT(*) FROM proxies WHERE ping_ms < 9999", fetchone=True)[0]
+    await call.answer(f"Юзеров: {u}\nПрокси: {p}\nЖивых: {pa}", show_alert=True)
+
+@router.callback_query(F.data == "admin_vip")
+async def give_vip(call: CallbackQuery, state: FSMContext):
+    await safe_edit(call, InputMediaPhoto(media=get_media(IMG_ADMIN), caption="Введите ID пользователя для вечного VIP:", parse_mode="HTML"), back_kb("admin_panel"))
+    await state.set_state(States.waiting_vip_id)
+
+@router.message(StateFilter(States.waiting_vip_id))
+async def vip_process(message: Message, state: FSMContext):
     await message.delete()
     if message.text.isdigit():
-        db_query("UPDATE users SET is_vip = 1 WHERE user_id = ?", (int(message.text),), commit=True)
-        msg = await message.answer("✅ Права администратора успешно выданы.")
+        db_query("UPDATE users SET is_vip_permanent = 1 WHERE user_id = ?", (int(message.text),), commit=True)
+        msg = await message.answer("✅ Права выданы")
+    else: msg = await message.answer("Ошибка")
     await state.clear()
     await asyncio.sleep(2)
     try: await msg.delete()
     except: pass
 
-# ================= ЛОГИКА: РАССЫЛКА (ИСПОЛЬЗУЕТ INFA.PNG) =================
-@router.message(Command("everyone"))
-async def cmd_everyone(message: Message):
-    if not is_admin(message.from_user.id): return
-    text = message.text.replace("/everyone", "").strip()
-    if not text:
-        return await message.answer("Использование: /everyone [текст сообщения]")
-    
+@router.callback_query(F.data == "admin_broadcast")
+async def broadcast(call: CallbackQuery, state: FSMContext):
+    await safe_edit(call, InputMediaPhoto(media=get_media(IMG_INFA), caption="Введите текст рассылки (будет использована картинка infa.png):", parse_mode="HTML"), back_kb("admin_panel"))
+    await state.set_state(States.waiting_broadcast)
+
+@router.message(StateFilter(States.waiting_broadcast))
+async def broadcast_process(message: Message, state: FSMContext):
     await message.delete()
     users = db_query("SELECT user_id FROM users", fetchall=True)
-    sent = 0
-    
-    # Использует INFA.PNG
-    photo = ensure_image_exists(IMG_INFA)
-    
-    status_msg = await message.answer("Начинаю рассылку...")
-    for (uid,) in users:
+    msg = await message.answer("🚀 Рассылка началась...")
+    count = 0
+    photo = get_media(IMG_INFA)
+    for u in users:
         try:
-            await bot.send_photo(chat_id=uid, photo=photo, caption=f"📣 <b>Уведомление от сервиса:</b>\n\n{text}", parse_mode="HTML")
-            sent += 1
-            await asyncio.sleep(0.05) 
+            await bot.send_photo(u[0], photo=photo, caption=message.text, parse_mode="HTML")
+            count += 1
+            await asyncio.sleep(0.05)
         except: pass
-    
-    await status_msg.edit_text(f"✅ Рассылка завершена. Успешно доставлено: {sent} чел.")
-    await asyncio.sleep(5)
-    try: await status_msg.delete()
-    except: pass
+    await msg.edit_text(f"✅ Рассылка завершена: {count} получено.")
+    await state.clear()
 
 # ================= ЗАПУСК =================
 async def main():
-    print("Инициализация БД...")
+    print("Запуск SalutProxy...")
+    ensure_files_exist()
     init_db()
-    print("Выполняется первичная проверка серверов...")
+    
+    # Загружаем прокси из файла при старте
+    loaded = load_proxies_from_file()
+    print(f"Загружено из proxy.txt: {loaded}")
+    
+    # Первичный пинг
+    print("Пинг серверов...")
     await update_all_pings()
     
+    # Фоновая задача
     asyncio.create_task(background_ping_task())
     
-    print("Бот SalutProxy успешно запущен и готов к работе.")
+    print("Бот в сети!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        print("Бот остановлен")
