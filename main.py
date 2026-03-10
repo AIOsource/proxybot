@@ -98,6 +98,23 @@ class DatabaseManager:
                 UNIQUE(server, port)
             )
         ''')
+
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS reviews (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER UNIQUE,
+                username TEXT,
+                stars INTEGER,
+                text TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
+        # Добавляем колонку активности для существующих баз данных
+        try:
+            cursor.execute("ALTER TABLE users ADD COLUMN last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+        except sqlite3.OperationalError:
+            pass # Колонка уже существует
         
         conn.commit()
         conn.close()
@@ -266,6 +283,10 @@ class ProxyManager:
 
         return proxies[index], note
 
+    def get_alive_count(self) -> int:
+        row = self.db.fetch_one("SELECT COUNT(*) FROM proxies WHERE ping < 9999")
+        return row[0] if row else 0
+
 # ==============================================================================
 #                               USER MANAGER
 # ==============================================================================
@@ -307,6 +328,24 @@ class UserManager:
             "SELECT refs_count, is_vip_permanent, vip_expires_at, country_pref FROM users WHERE user_id = ?", 
             (user_id,)
         )
+
+    def mark_active(self, user_id: int):
+        self.db.execute("UPDATE users SET last_active = CURRENT_TIMESTAMP WHERE user_id = ?", (user_id,), commit=True)
+
+    def get_stats(self):
+        total = self.db.fetch_one("SELECT COUNT(*) FROM users")[0]
+        # Считаем активными тех, кто пользовался ботом за последние 24 часа
+        active = self.db.fetch_one("SELECT COUNT(*) FROM users WHERE datetime(last_active) >= datetime('now', '-1 day')")[0]
+        return total, active
+
+    def get_all_users_formatted(self):
+        users = self.db.fetch_all("SELECT user_id, username, refs_count, last_active FROM users ORDER BY last_active DESC")
+        lines = ["Список пользователей платформы (Сортировка по активности):\n", "="*60]
+        for u in users:
+            uid, uname, refs, last_act = u
+            un = f"@{uname}" if uname else "Без юзернейма"
+            lines.append(f"ID: {uid} | {un} | Рефов: {refs} | Был в сети: {last_act}")
+        return "\n".join(lines)
 
     def get_tier_info(self, user_id: int):
         if user_id == ADMIN_ID:
@@ -350,13 +389,17 @@ class Keyboards:
         kb.button(text="💎 Привилегии", callback_data="privileges")
         kb.button(text="🛒 Купить Premium", callback_data="buy_premium")
         kb.button(text="👥 Партнерская сеть", callback_data="referrals")
+        kb.button(text="⭐️ Отзывы", callback_data="reviews_list")
         kb.button(text="💬 Поддержка", callback_data="support")
-        kb.button(text="👑 Администрация", callback_data="admins_list")
         kb.button(text="ℹ️ Информация", callback_data="about")
+        
+        # Кнопки администрации показываем ТОЛЬКО админу
         if is_admin: 
+            kb.button(text="👑 Администрация", callback_data="admins_list")
             kb.button(text="⚙️ Управление (Админ)", callback_data="admin_panel")
-            kb.adjust(1, 1, 2, 2, 2, 1)
+            kb.adjust(1, 1, 2, 2, 2, 2)
         else:
+            # Обычные пользователи видят только 8 базовых кнопок
             kb.adjust(1, 1, 2, 2, 2)
         return kb.as_markup()
 
@@ -372,8 +415,34 @@ class Keyboards:
     @staticmethod
     def payment():
         kb = InlineKeyboardBuilder()
-        kb.button(text="✅ Я оплатил(а)", callback_data="support")
+        kb.button(text="✅ Я оплатил(а)", callback_data="payment_check")
         kb.button(text="Вернуться", callback_data="profile")
+        kb.adjust(1)
+        return kb.as_markup()
+
+    @staticmethod
+    def admin_payment(user_id: int):
+        kb = InlineKeyboardBuilder()
+        kb.button(text="✅ Одобрить: Средний ($5)", callback_data=f"pay_approve_{user_id}_30")
+        kb.button(text="✅ Одобрить: Базовый ($2)", callback_data=f"pay_approve_{user_id}_14")
+        kb.button(text="❌ Отклонить", callback_data=f"pay_reject_{user_id}")
+        kb.adjust(1)
+        return kb.as_markup()
+
+    @staticmethod
+    def reviews():
+        kb = InlineKeyboardBuilder()
+        kb.button(text="✍️ Оставить отзыв", callback_data="leave_review")
+        kb.button(text="Вернуться", callback_data="profile")
+        kb.adjust(1)
+        return kb.as_markup()
+
+    @staticmethod
+    def stars():
+        kb = InlineKeyboardBuilder()
+        for i in range(1, 6):
+            kb.button(text="⭐️" * i, callback_data=f"star_{i}")
+        kb.button(text="Отмена", callback_data="reviews_list")
         kb.adjust(1)
         return kb.as_markup()
 
@@ -385,8 +454,9 @@ class Keyboards:
         kb.button(text="🗑 Очистить базу", callback_data="adm_del")
         kb.button(text="📢 Рассылка", callback_data="adm_broadcast")
         kb.button(text="📊 Статистика", callback_data="adm_stats")
+        kb.button(text="👥 База юзеров", callback_data="adm_users_list")
         kb.button(text="Вернуться", callback_data="profile")
-        kb.adjust(2, 2, 1, 1)
+        kb.adjust(2, 2, 2, 1)
         return kb.as_markup()
 
     @staticmethod
@@ -405,6 +475,7 @@ class States(StatesGroup):
     support_reply = State()
     admin_add_proxy = State()
     admin_broadcast = State()
+    review_text = State()
 
 db = DatabaseManager(DB_NAME)
 pm = ProxyManager(db)
@@ -425,6 +496,9 @@ async def cmd_start(message: Message):
         try: await bot.send_message(ref_id, f"✦ <b>Новый участник в вашей сети!</b> +1 день Premium.")
         except: pass
 
+    # Отмечаем активность
+    um.mark_active(uid)
+
     try: await message.delete()
     except: pass
     
@@ -439,6 +513,10 @@ async def cmd_start(message: Message):
 async def show_profile(call: CallbackQuery, state: FSMContext):
     await state.clear()
     uid = call.from_user.id
+    
+    # Отмечаем активность
+    um.mark_active(uid)
+    
     info = um.get_info(uid)
     if not info:
         um.register(uid, call.from_user.username)
@@ -450,12 +528,15 @@ async def show_profile(call: CallbackQuery, state: FSMContext):
     if uid == ADMIN_ID: vip_status = "Бессрочный"
     is_admin = (uid == ADMIN_ID)
     
+    alive_proxies = pm.get_alive_count()
+    
     text = (f"👤 <b>КАБИНЕТ ПОЛЬЗОВАТЕЛЯ</b>\n\n"
             f"⌗ ID: <code>{uid}</code>\n"
             f"✦ Статус: <b>{tier['name']}</b>\n"
             f"🛡 Привилегии: <b>{vip_status}</b>\n"
             f"👥 Партнерская сеть: <b>{refs}</b>\n"
-            f"🌐 Маршрутизация: <b>{pref}</b>\n\n"
+            f"🌐 Маршрутизация: <b>{pref}</b>\n"
+            f"✅ Активных серверов: <b>{alive_proxies}</b>\n\n"
             f"⚡ Скорость соединения: <i>{tier['speed']}</i>")
     
     await try_edit(call, ASSETS["PROFILE"], text, Keyboards.profile(is_admin, pref))
@@ -506,18 +587,123 @@ async def privileges_handler(call: CallbackQuery):
 
 @router.callback_query(F.data == "buy_premium")
 async def buy_premium_handler(call: CallbackQuery):
-    text = (f"🛒 <b>ПОКУПКА PREMIUM ДОСТУПА</b>\n\n"
-            f"Получите максимальную скорость и приоритет без приглашения рефералов!\n\n"
-            f"Стоимость: <b>$5 / месяц</b>\n"
-            f"Способ оплаты: <b>CryptoBot (USDT/TON)</b>\n\n"
-            f"<i>Интеграция бота автоматической оплаты в процессе разработки...</i>\n\n"
-            f"Для ручной оплаты переведите средства на следующий TRC20 адрес:\n"
-            f"<code>Txxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx</code>\n\n"
-            f"<i>После оплаты нажмите кнопку ниже или отправьте скриншот в поддержку.</i>")
+    text = (f"🛒 <b>ПОКУПКА ДОСТУПА</b>\n\n"
+            f"Получите приоритетный доступ без приглашения друзей!\n\n"
+            f"<b>Доступные тарифы:</b>\n"
+            f"🔹 <b>Тариф Средний</b> — $5 / 30 дней <i>(Максимальная скорость)</i>\n"
+            f"🔹 <b>Тариф Базовый</b> — $2 / 14 дней <i>(Высокая скорость)</i>\n\n"
+            f"Способ оплаты: <b>CryptoBot (TON / USDT)</b>\n\n"
+            f"Для оплаты перейдите по ссылке (счет в CryptoBot):\n"
+            f"👉 <b><a href='https://t.me/send?start=IV0fjJRuSt2W'>ОПЛАТИТЬ СЧЕТ</a></b>\n"
+            f"<code>https://t.me/send?start=IV0fjJRuSt2W</code>\n\n"
+            f"<i>После успешной оплаты обязательно нажмите кнопку «Я оплатил(а)», чтобы администратор проверил транзакцию.</i>")
     await try_edit(call, ASSETS["PROXY"], text, Keyboards.payment())
+
+@router.callback_query(F.data == "payment_check")
+async def payment_check_handler(call: CallbackQuery):
+    uid = call.from_user.id
+    username = call.from_user.username or "Без юзернейма"
+    
+    text_admin = (f"💰 <b>Запрос на проверку оплаты</b>\n\n"
+                  f"От: @{username} (<code>{uid}</code>)\n"
+                  f"Пользователь нажал кнопку «Я оплатил(а)».\n"
+                  f"Убедитесь в поступлении средств и выберите тариф для зачисления:")
+    try:
+        await bot.send_message(ADMIN_ID, text_admin, reply_markup=Keyboards.admin_payment(uid), parse_mode="HTML")
+        await call.answer("✅ Запрос отправлен! Ожидайте подтверждения от администрации.", show_alert=True)
+    except Exception as e:
+        logger.error(f"Failed to send payment check: {e}")
+        await call.answer("❌ Ошибка отправки запроса. Попробуйте позже.", show_alert=True)
+
+@router.callback_query(F.data.startswith("pay_approve_"))
+async def pay_approve_handler(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID: return
+    parts = call.data.split('_')
+    target_uid = int(parts[2])
+    days = int(parts[3])
+    
+    user = db.fetch_one("SELECT vip_expires_at FROM users WHERE user_id = ?", (target_uid,))
+    now = datetime.now()
+    if user and user[0]:
+        try:
+            curr_date = datetime.strptime(user[0], "%Y-%m-%d %H:%M:%S")
+            new_date = max(now, curr_date) + timedelta(days=days)
+        except: new_date = now + timedelta(days=days)
+    else:
+        new_date = now + timedelta(days=days)
+        
+    db.execute("UPDATE users SET vip_expires_at = ? WHERE user_id = ?", 
+               (new_date.strftime("%Y-%m-%d %H:%M:%S"), target_uid), commit=True)
+               
+    tariff_name = "Средний (30 дней)" if days == 30 else "Базовый (14 дней)"
+    await call.message.edit_text(f"✅ Вы подтвердили оплату.\nПользователю <code>{target_uid}</code> выдан тариф <b>{tariff_name}</b>.", parse_mode="HTML")
+    
+    try:
+        await bot.send_message(target_uid, f"🎉 <b>Оплата подтверждена!</b>\n\nВам зачислен тариф <b>{tariff_name}</b>. Скорость и приоритет маршрутизации успешно обновлены!", parse_mode="HTML")
+    except: pass
+
+@router.callback_query(F.data.startswith("pay_reject_"))
+async def pay_reject_handler(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID: return
+    target_uid = int(call.data.split('_')[2])
+    await call.message.edit_text(f"❌ Запрос на оплату от <code>{target_uid}</code> отклонен.", parse_mode="HTML")
+    try:
+        await bot.send_message(target_uid, "❌ <b>Оплата не подтверждена.</b>\nТранзакция не найдена. Если вы считаете, что произошла ошибка, свяжитесь со службой поддержки.", parse_mode="HTML")
+    except: pass
+
+@router.callback_query(F.data == "reviews_list")
+async def reviews_list_handler(call: CallbackQuery):
+    reviews = db.fetch_all("SELECT username, user_id, stars, text FROM reviews ORDER BY id DESC LIMIT 5")
+    
+    text = "⭐️ <b>ОТЗЫВЫ КЛИЕНТОВ</b>\n\n"
+    if not reviews:
+        text += "<i>Пока нет отзывов. Оцените качество нашего сервиса первыми!</i>\n\n"
+    else:
+        for r in reviews:
+            uname = r[0] if r[0] else "Аноним"
+            uid = r[1]
+            stars = "⭐️" * r[2]
+            r_text = r[3]
+            text += f"👤 <b>@{uname}</b> (<code>{uid}</code>)\n"
+            text += f"Оценка: {stars}\n"
+            text += f"💬 <i>«{r_text}»</i>\n"
+            text += "〰️〰️〰️〰️〰️〰️〰️〰️\n"
+            
+        text += "\n<i>Показаны последние 5 отзывов.</i>"
+        
+    await try_edit(call, ASSETS["PROXY"], text, Keyboards.reviews())
+
+@router.callback_query(F.data == "leave_review")
+async def leave_review_start(call: CallbackQuery):
+    await try_edit(call, ASSETS["PROXY"], "⭐️ <b>ОЦЕНКА СЕРВИСА</b>\n\nВыберите вашу оценку от 1 до 5 звезд:", Keyboards.stars())
+
+@router.callback_query(F.data.startswith("star_"))
+async def process_star(call: CallbackQuery, state: FSMContext):
+    stars = int(call.data.split('_')[1])
+    await state.update_data(stars=stars)
+    await try_edit(call, ASSETS["PROXY"], f"Вы выбрали {stars} ⭐️.\n\nТеперь напишите текст вашего отзыва одним сообщением (до 500 символов):", Keyboards.back("reviews_list"))
+    await state.set_state(States.review_text)
+
+@router.message(StateFilter(States.review_text))
+async def process_review_text(message: Message, state: FSMContext):
+    data = await state.get_data()
+    stars = data.get('stars', 5)
+    uid = message.from_user.id
+    username = message.from_user.username or message.from_user.first_name
+    text = message.text[:500] 
+    
+    db.execute("INSERT OR REPLACE INTO reviews (user_id, username, stars, text) VALUES (?, ?, ?, ?)", 
+               (uid, username, stars, text), commit=True)
+    
+    kb = InlineKeyboardBuilder().button(text="Вернуться к отзывам", callback_data="reviews_list").as_markup()
+    await message.answer("✅ <b>Спасибо за отзыв!</b>\nОн успешно сохранен и опубликован в общем списке.", parse_mode="HTML", reply_markup=kb)
+    await state.clear()
 
 @router.callback_query(F.data == "admins_list")
 async def admins_list_handler(call: CallbackQuery):
+    # Дополнительная защита: если кто-то попытается вызвать этот раздел напрямую
+    if call.from_user.id != ADMIN_ID: return
+    
     text = (f"👑 <b>АДМИНИСТРАЦИЯ ПРОЕКТА</b>\n\n"
             f"Наша команда следит за стабильностью работы серверов и высоким качеством предоставляемых услуг.\n\n"
             f"<b>Владелец и Главный Администратор:</b>\n"
@@ -582,10 +768,26 @@ async def adm_load(call: CallbackQuery):
 
 @router.callback_query(F.data == "adm_stats")
 async def adm_stats(call: CallbackQuery):
-    uc = db.fetch_one("SELECT COUNT(*) FROM users")[0]
+    total_users, active_users = um.get_stats()
     pc = db.fetch_one("SELECT COUNT(*) FROM proxies")[0]
     pa = db.fetch_one("SELECT COUNT(*) FROM proxies WHERE ping < 9999")[0]
-    await call.answer(f"📊 СТАТИСТИКА:\n\nПользователей: {uc}\nВсего прокси: {pc}\nЖивых прокси: {pa}", show_alert=True)
+    await call.answer(f"📊 СТАТИСТИКА:\n\nПользователей всего: {total_users}\nОнлайн (за 24ч): {active_users}\nВсего прокси: {pc}\nЖивых прокси: {pa}", show_alert=True)
+
+@router.callback_query(F.data == "adm_users_list")
+async def adm_users_list(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID: return
+    await call.answer("⏳ Формирую выгрузку базы...", show_alert=False)
+    
+    text_data = um.get_all_users_formatted()
+    filename = "users_export.txt"
+    with open(filename, "w", encoding="utf-8") as f:
+        f.write(text_data)
+        
+    await call.message.answer_document(
+        FSInputFile(filename), 
+        caption="📁 <b>База пользователей</b>\nФормат: ID | Юзернейм | Рефералы | Последняя активность", 
+        parse_mode="HTML"
+    )
 
 @router.callback_query(F.data == "adm_add")
 async def adm_add(call: CallbackQuery, state: FSMContext):
